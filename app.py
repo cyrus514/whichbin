@@ -10,17 +10,22 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 # --- Settings (change via environment variables) ---
 API_KEY = os.environ.get("GEMINI_API_KEY")
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")  # check AI Studio for the current name
-MAX_REQUESTS_PER_HOUR = int(os.environ.get("MAX_REQUESTS_PER_HOUR", "20"))  # per visitor
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash")
+MAX_REQUESTS_PER_HOUR = int(os.environ.get("MAX_REQUESTS_PER_HOUR", "20"))
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 VALID_BINS = {"recycling", "paper", "glass", "compost", "landfill", "dropoff"}
 
 app = Flask(__name__, static_folder="static")
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)  # real visitor IP behind Render/etc.
-app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024  # 6 MB upload cap
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
+app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024
 
-client = genai.Client(api_key=API_KEY) if API_KEY else None
-hits = defaultdict(deque)  # ip -> timestamps of recent requests
+client = (
+    genai.Client(api_key=API_KEY, http_options=types.HttpOptions(timeout=12000))
+    if API_KEY
+    else None
+)
+hits = defaultdict(deque)
 
 PROMPT = """You are a waste-sorting helper. Look at the attached photo and identify the single main item to throw away.
 Reply with ONLY JSON, no markdown:
@@ -40,6 +45,26 @@ def too_many(ip):
     return False
 
 
+def ask_ai(image_part):
+    """Try the main model, then the backup model. Returns parsed JSON or raises."""
+    models = [MODEL]
+    if FALLBACK_MODEL and FALLBACK_MODEL != MODEL:
+        models.append(FALLBACK_MODEL)
+    last_error = None
+    for name in models:
+        try:
+            resp = client.models.generate_content(
+                model=name,
+                contents=[image_part, PROMPT],
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            return json.loads(resp.text)
+        except Exception as e:
+            last_error = e
+            app.logger.warning("Model %s failed: %s", name, e)
+    raise last_error
+
+
 @app.get("/")
 def home():
     return send_from_directory("static", "index.html")
@@ -57,31 +82,11 @@ def identify():
         return jsonify(error="Please upload a JPEG, PNG or WebP photo."), 400
 
     try:
-              image = types.Part.from_bytes(data=f.read(), mime_type=f.mimetype)
-       models = [MODEL] + [m for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash").split(",") if m and m != MODEL]
-       data = None
-       last_error = None
-       for model_name in models:
-           for attempt in range(2):
-               try:
-                   resp = client.models.generate_content(
-                       model=model_name,
-                       contents=[image, PROMPT],
-                       config=types.GenerateContentConfig(response_mime_type="application/json"),
-                   )
-                   data = json.loads(resp.text)
-                   break
-               except Exception as e:
-                   last_error = e
-                   app.logger.warning("Gemini %s attempt %d failed: %s", model_name, attempt + 1, e)
-                   time.sleep(1.5)
-           if data is not None:
-               break
-       try:
-           if data is None:
-               raise last_error
+        image_part = types.Part.from_bytes(data=f.read(), mime_type=f.mimetype)
+        data = ask_ai(image_part)
+    except Exception as e:
         app.logger.exception("Gemini call failed: %s", e)
-        return jsonify(error="The AI couldn't read that photo. Try another one."), 502
+        return jsonify(error="The AI is busy right now. Please try again in a minute."), 502
 
     ranked = [b for b in data.get("ranked_bins", []) if b in VALID_BINS] or ["landfill"]
     return jsonify(
