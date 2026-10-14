@@ -57,13 +57,29 @@ def identify():
         return jsonify(error="Please upload a JPEG, PNG or WebP photo."), 400
 
     try:
-        resp = client.models.generate_content(
-            model=MODEL,
-            contents=[types.Part.from_bytes(data=f.read(), mime_type=f.mimetype), PROMPT],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
-        data = json.loads(resp.text)
-    except Exception as e:  # keep details in server logs, not in the browser
+              image = types.Part.from_bytes(data=f.read(), mime_type=f.mimetype)
+       models = [MODEL] + [m for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash").split(",") if m and m != MODEL]
+       data = None
+       last_error = None
+       for model_name in models:
+           for attempt in range(2):
+               try:
+                   resp = client.models.generate_content(
+                       model=model_name,
+                       contents=[image, PROMPT],
+                       config=types.GenerateContentConfig(response_mime_type="application/json"),
+                   )
+                   data = json.loads(resp.text)
+                   break
+               except Exception as e:
+                   last_error = e
+                   app.logger.warning("Gemini %s attempt %d failed: %s", model_name, attempt + 1, e)
+                   time.sleep(1.5)
+           if data is not None:
+               break
+       try:
+           if data is None:
+               raise last_error
         app.logger.exception("Gemini call failed: %s", e)
         return jsonify(error="The AI couldn't read that photo. Try another one."), 502
 
